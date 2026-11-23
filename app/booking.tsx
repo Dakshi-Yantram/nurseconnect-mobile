@@ -1,0 +1,1049 @@
+/**
+ * Booking creation.
+ *
+ * Everything here comes from the backend: the package (and its price), the
+ * consumer's patients, and their saved addresses. The previous version made up
+ * an hourly rate, a 20% "subsidy" and a ₹49 platform fee, then never called
+ * the booking API at all — so nothing it showed matched what was charged, and
+ * no nurse was ever dispatched.
+ */
+import React, { useCallback, useMemo, useState } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+  Alert,
+  ActivityIndicator,
+  TextInput,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
+import { Ionicons } from '@expo/vector-icons';
+import * as Location from 'expo-location';
+import { hospitalService, hospitalError, isHospitalPackage } from '../services/hospital.service';
+import { Header } from '../components/Header';
+import { GradientButton } from '../components/GradientButton';
+import {
+  PrescriptionSupplyGate,
+  PrescriptionSupplyResult,
+} from '../components/PrescriptionSupplyGate';
+import { compositeCareService } from '../services/composite-care.service';
+import { InputField } from '../components/InputField';
+import { OfflineBanner } from '../components/OfflineBanner';
+import { Colors, Radius, Shadows, Spacing, Typography } from '../constants/theme';
+import { useStore } from '../store';
+import { formatAddress } from '../services/addresses.service';
+import { bookingsService, type SlotsResponse } from '../services/bookings.service';
+import { inr, to24HourTime } from '../lib/format';
+import { clearDraft, loadDraft, saveDraft } from '../lib/booking-draft';
+import { publicService, type BookingOptions } from '../services/public.service';
+import { MaterialsChecklist, allMaterialsChecked } from '../components/MaterialsChecklist';
+import { isBreastfeeding } from '../lib/package-name';
+import { BookingPreferencesCard, emptyPrefs, validatePrefs, type PrefsValue } from '../components/BookingPreferencesCard';
+import { visitExtensionsService } from '../services/visit-extensions.service';
+import {
+  packageMaterialsService,
+  type PackageMaterial,
+} from '../services/package-materials.service';
+
+/**
+ * 30-minute slots from 8:00 AM to 8:00 PM. Previously these jumped in
+ * 2-hour steps (8, 10, 12, 2, 4, 6) which left huge gaps and stopped at
+ * 6 PM — most on-demand booking apps (e.g. Urban Company) offer half-hour
+ * granularity across the full service day, so we match that here.
+ */
+type SlotOption = { label: string; hour: number; minute: number; surcharge: number };
+
+/** Offline fallback only — the real values come from GET /bookings/slots and win
+ *  whenever that call succeeds (must match the backend settings). */
+const FALLBACK_STANDARD_START_MIN = 9 * 60;
+const FALLBACK_STANDARD_END_MIN = 18 * 60 + 30;
+const FALLBACK_OFF_HOURS_SURCHARGE = 100;
+
+function buildAllSlots(): SlotOption[] {
+  const out: SlotOption[] = [];
+  for (let totalMin = 8 * 60; totalMin <= 20 * 60; totalMin += 30) {
+    const hour = Math.floor(totalMin / 60);
+    const minute = totalMin % 60;
+    const period = hour < 12 ? 'AM' : 'PM';
+    const h12 = hour % 12 === 0 ? 12 : hour % 12;
+    out.push({
+      label: `${String(h12).padStart(2, '0')}:${String(minute).padStart(2, '0')} ${period}`,
+      hour,
+      minute,
+      surcharge:
+        totalMin >= FALLBACK_STANDARD_START_MIN && totalMin <= FALLBACK_STANDARD_END_MIN
+          ? 0
+          : FALLBACK_OFF_HOURS_SURCHARGE,
+    });
+  }
+  return out;
+}
+
+const ALL_SLOTS = buildAllSlots();
+
+/** Minutes of lead time required before a slot can be booked (prep/travel time for the nurse). */
+const SLOT_LEAD_MINUTES = 120; // matches the backend's 2-hour notice rule
+
+/** Next 14 days, built in local time so "today" is the user's today. */
+function buildDays() {
+  const out: { date: Date; ymd: string; weekday: string; day: string }[] = [];
+  const today = new Date();
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + i);
+    const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+      d.getDate(),
+    ).padStart(2, '0')}`;
+    out.push({
+      date: d,
+      ymd,
+      weekday: d.toLocaleDateString('en-IN', { weekday: 'short' }),
+      day: String(d.getDate()),
+    });
+  }
+  return out;
+}
+
+export default function BookingScreen() {
+  const router = useRouter();
+  const { packageId, followUpOf } = useLocalSearchParams<{ packageId?: string; followUpOf?: string }>();
+
+  const packages = useStore((s) => s.packages);
+  const authUser = useStore((s) => s.user);
+  const authBootstrapping = useStore((s) => s.authBootstrapping);
+  const setRoleForLogin = useStore((s) => s.setRole);
+
+  // A signed-out visitor who deep-links here (or whose session lapsed) is sent
+  // to sign in with the booking saved, never shown a half-working form.
+  React.useEffect(() => {
+    if (authBootstrapping || authUser) return;
+    (async () => {
+      if (packageId) await saveDraft({ packageId: String(packageId), resume: true });
+      setRoleForLogin('family');
+      router.replace({ pathname: '/login', params: { role: 'family', reason: 'book' } });
+    })();
+  }, [authBootstrapping, authUser, packageId, router, setRoleForLogin]);
+  const patients = useStore((s) => s.patients);
+  const addresses = useStore((s) => s.addresses);
+  const loadPatients = useStore((s) => s.loadPatients);
+  const loadAddresses = useStore((s) => s.loadAddresses);
+  const loadPackages = useStore((s) => s.loadPackages);
+  const createBookingAPI = useStore((s) => s.createBookingAPI);
+
+  const days = useMemo(buildDays, []);
+  const [dayIdx, setDayIdx] = useState(0);
+
+  /**
+   * Slots for the selected day. For today, anything less than
+   * SLOT_LEAD_MINUTES away (or already passed) is filtered out so the user
+   * can never submit a booking for a time that's already gone. Other days
+   * show the full day's slots.
+   */
+  // Real slots + off-hours surcharge from the backend (same call the website uses).
+  const [slotData, setSlotData] = useState<SlotsResponse | null>(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    setSlotData(null);
+    bookingsService
+      .slots(days[dayIdx].ymd)
+      .then((d) => {
+        if (!cancelled) setSlotData(d);
+      })
+      .catch(() => {}); // offline / error -> local fallback below
+    return () => {
+      cancelled = true;
+    };
+  }, [days, dayIdx]);
+
+  const availableSlots = useMemo<SlotOption[]>(() => {
+    if (slotData) {
+      return slotData.slots
+        .filter((s) => s.available)
+        .map((s) => {
+          const [h, m] = s.value.split(':').map(Number);
+          return { label: s.label, hour: h, minute: m, surcharge: s.surcharge };
+        });
+    }
+    const selectedDay = days[dayIdx];
+    const isToday = dayIdx === 0;
+    if (!isToday) return ALL_SLOTS;
+    const now = new Date();
+    const earliest = new Date(now.getTime() + SLOT_LEAD_MINUTES * 60 * 1000);
+    return ALL_SLOTS.filter((s) => {
+      const slotTime = new Date(
+        selectedDay.date.getFullYear(),
+        selectedDay.date.getMonth(),
+        selectedDay.date.getDate(),
+        s.hour,
+        s.minute,
+      );
+      return slotTime >= earliest;
+    });
+  }, [days, dayIdx, slotData]);
+
+  const [slot, setSlot] = useState(availableSlots[0]?.label ?? ALL_SLOTS[0].label);
+
+  // If the chosen day changes (or time simply passes) and the currently
+  // selected slot is no longer valid, snap to the first available one
+  // instead of silently letting a stale/past slot stay submittable.
+  React.useEffect(() => {
+    if (availableSlots.length === 0) return;
+    if (!availableSlots.some((s) => s.label === slot)) {
+      setSlot(availableSlots[0].label);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availableSlots]);
+  // Apply the date/time the visitor picked on the public pages before signing
+  // in. Re-validated against the live slot list: if that time is no longer
+  // bookable it is simply dropped and the normal default applies.
+  const pendingTime = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    loadDraft().then((d) => {
+      if (!alive) return;
+      if (d.packageId && packageId && d.packageId !== packageId) return; // draft belongs to another package
+      if (d.date) {
+        const i = days.findIndex((x) => x.ymd === d.date);
+        if (i >= 0) setDayIdx(i);
+      }
+      pendingTime.current = d.time ?? null;
+      if (d.prescriptionOption) setRxOption(d.prescriptionOption);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [days, packageId]);
+  React.useEffect(() => {
+    if (!pendingTime.current || !slotData || slotData.date !== days[dayIdx].ymd) return;
+    const match = slotData.slots.find((x) => x.value === pendingTime.current && x.available);
+    pendingTime.current = null;
+    if (match) setSlot(match.label);
+  }, [slotData, days, dayIdx]);
+
+  const [patientId, setPatientId] = useState<string | null>(null);
+  const [addressId, setAddressId] = useState<string | null>(null);
+  const [notes, setNotes] = useState('');
+  // TEMPORARY / DEMO prescription option (server decides if/what fee; never charged).
+  const [rxOption, setRxOption] = useState<'yes' | 'no' | undefined>(undefined);
+  const [rxDemo, setRxDemo] = useState<BookingOptions['prescription_demo'] | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    publicService
+      .bookingOptions()
+      .then((o) => alive && setRxDemo(o?.prescription_demo?.enabled ? o.prescription_demo : null))
+      .catch(() => alive && setRxDemo(null));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const chooseRx = (v: 'yes' | 'no') => {
+    setRxOption(v);
+    saveDraft({ prescriptionOption: v }).catch(() => {});
+  };
+  const [isUrgent, setIsUrgent] = useState(false);
+  // Same-nurse / trusted contact / privacy. Shown only when the backend feature is on.
+  const [prefs, setPrefs] = useState<PrefsValue>(emptyPrefs);
+  const [prefsEnabled, setPrefsEnabled] = useState(false);
+  React.useEffect(() => {
+    visitExtensionsService.config().then((c) => setPrefsEnabled(!!c)).catch(() => {});
+  }, []);
+  const savePrefs = async (bookingId: string) => {
+    if (!prefsEnabled) return;
+    try {
+      await visitExtensionsService.savePreferences(bookingId, {
+        same_nurse_preference: prefs.same_nurse_preference,
+        ask_before_sharing: prefs.ask_before_sharing,
+        trusted_contact_name: prefs.trusted_contact_name.trim() || null,
+        trusted_contact_relation: prefs.trusted_contact_relation.trim() || null,
+        trusted_contact_phone: prefs.trusted_contact_phone.trim() || null,
+        ...(followUpOf ? { follow_up_of_booking_id: String(followUpOf) } : {}),
+      });
+    } catch {
+      // Never block payment on a preference; the family can still book.
+    }
+  };
+  const [submitting, setSubmitting] = useState(false);
+  const [gateOpen, setGateOpen] = useState(false);
+  // Materials checklist (1st of 2 confirmations; the 2nd is on /payment).
+  const [materials, setMaterials] = useState<PackageMaterial[]>([]);
+  const [matChecked, setMatChecked] = useState<Record<string, boolean>>({});
+  // Hospital Visit Companion: hospital + transport (only used for that package).
+  const [hospQuery, setHospQuery] = useState('');
+  const [hospital, setHospital] = useState<{ name: string; address: string; lat: number; lng: number; km: number; ok: boolean } | null>(null);
+  const [hospBusy, setHospBusy] = useState(false);
+  const [cabByUs, setCabByUs] = useState(true);
+  // Prescription packages only: who brings the medicines & materials.
+  const [suppliesMode, setSuppliesMode] = useState<'own' | 'nurse_brings'>('own');
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setMaterials([]);
+    setMatChecked({});
+    setSuppliesMode('own');
+    if (!packageId) return;
+    packageMaterialsService
+      .listForPackage(packageId)
+      .then((list) => {
+        if (!cancelled) setMaterials(list);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [packageId]);
+
+  const materialsTotal = useMemo(
+    () => materials.reduce((sum, m) => sum + (parseFloat(m.price) || 0) * (m.quantity || 1), 0),
+    [materials],
+  );
+
+  /** Save the booking-stage confirmation. Never blocks navigation: if it
+   *  fails, the payment screen re-sends it before the payment-stage one. */
+  const ackBookingMaterials = async (bookingId: string) => {
+    if (!needsMaterials) return;
+    try {
+      await packageMaterialsService.ack(bookingId, 'booking', matChecked);
+    } catch {
+      // handled on /payment
+    }
+  };
+
+  useFocusEffect(
+    useCallback(() => {
+      // Patients and addresses can be created from screens pushed on top of
+      // this one, so re-read them each time this screen regains focus.
+      loadPatients().catch(() => {});
+      loadAddresses().catch(() => {});
+      if (packages.length === 0) loadPackages().catch(() => {});
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [loadPatients, loadAddresses, loadPackages]),
+  );
+
+  // Default to the patient/address already on file so the common case is one tap.
+  const effectivePatientId = patientId ?? patients[0]?.id ?? null;
+  const effectiveAddressId =
+    addressId ?? addresses.find((a) => a.is_default)?.id ?? addresses[0]?.id ?? null;
+
+  const pkg = useMemo(
+    () => packages.find((p) => p.id === packageId) ?? null,
+    [packages, packageId],
+  );
+
+  const isHospital = isHospitalPackage(pkg as any);
+
+  const price = useMemo(() => {
+    if (!pkg) return 0;
+    const packagePrice = parseFloat(pkg.package_price ?? '');
+    if (!isNaN(packagePrice) && packagePrice > 0) return packagePrice;
+    const perVisit = parseFloat(pkg.per_visit_price ?? '');
+    return isNaN(perVisit) ? 0 : perVisit;
+  }, [pkg]);
+
+  const selectedAddress = addresses.find((a) => a.id === effectiveAddressId) ?? null;
+  const selectedPatient = patients.find((p) => p.id === effectivePatientId) ?? null;
+
+  // Which of the three booking flows this package takes.
+  //   Workflow 1 — bundled procedural kit
+  //   Workflow 2 — patient brings their own supplies (needs the guardrail)
+  //   otherwise  — ordinary booking, no prescription gate
+  const isComposite = !!pkg?.material_included;
+  const isServiceOnly = !!pkg?.requires_prescription && !pkg?.material_included;
+  const needsPrescriptionGate = isComposite || isServiceOnly;
+
+  // "Add materials": the nurse brings the kit and the cost is added to the total.
+  // Offered only for prescription packages that have a priced materials list.
+  const canAddMaterials = isServiceOnly && materialsTotal > 0;
+  const nurseBrings = canAddMaterials && suppliesMode === 'nurse_brings';
+  // The "Materials the nurse will bring" checklist applies unless the patient
+  // is arranging their own supplies for a prescription package.
+  const needsMaterials = materials.length > 0 && (!isServiceOnly || nurseBrings);
+  const materialsOk = !needsMaterials || allMaterialsChecked(materials, matChecked);
+  // Off-hours time-slot fee (backend adds it to the total at booking).
+  const slotSurcharge = availableSlots.find((x) => x.label === slot)?.surcharge ?? 0;
+  const standardHours = slotData?.standard_hours ?? '9:00 AM – 6:30 PM';
+  const totalPrice = price + (nurseBrings ? materialsTotal : 0) + slotSurcharge;
+
+  /** Shared guard for the three preconditions every flow needs. */
+  const validate = (): boolean => {
+    if (prefsEnabled) {
+      const prefsError = validatePrefs(prefs);
+      if (prefsError) {
+        Alert.alert('Check your support contact', prefsError);
+        return false;
+      }
+    }
+    if (!pkg) {
+      Alert.alert('Choose a care package', 'Go back and pick the care you need.');
+      return false;
+    }
+    if (!effectivePatientId) {
+      Alert.alert('Add a patient', 'Tell us who this visit is for before booking.', [
+        { text: 'Not now', style: 'cancel' },
+        { text: 'Add patient', onPress: () => router.push('/patients') },
+      ]);
+      return false;
+    }
+    if (!effectiveAddressId) {
+      Alert.alert('Add an address', 'We need a service address to dispatch a nurse.', [
+        { text: 'Not now', style: 'cancel' },
+        { text: 'Add address', onPress: () => router.push('/addresses') },
+      ]);
+      return false;
+    }
+    if (!materialsOk) {
+      Alert.alert(
+        'Confirm the materials',
+        'Please tick every item in “Materials the nurse will bring” to continue.',
+      );
+      return false;
+    }
+    if (isHospital && !hospital) {
+      Alert.alert('Choose the hospital', 'Search for the hospital so we can check the distance.');
+      return false;
+    }
+    if (isHospital && hospital && !hospital.ok) {
+      Alert.alert('Hospital is too far', `This hospital is about ${hospital.km} km away. Please contact us to enquire.`, [
+        { text: 'Not now', style: 'cancel' },
+        { text: 'Contact us', onPress: () => router.push('/contact') },
+      ]);
+      return false;
+    }
+    return true;
+  };
+
+  /** After the booking exists, attach the hospital + transport choice (server re-checks the distance). */
+  const saveHospitalDetails = async (bookingId: string): Promise<boolean> => {
+    if (!isHospital || !hospital) return true;
+    try {
+      await hospitalService.setDetails(bookingId, {
+        hospital_name: hospital.name, hospital_address: hospital.address,
+        hospital_latitude: hospital.lat, hospital_longitude: hospital.lng,
+        transport_option: cabByUs ? 'cab_by_nurseconnect' : 'own_transport',
+      });
+      return true;
+    } catch (e: any) {
+      Alert.alert('Hospital details not saved', hospitalError(e).message);
+      return false;
+    }
+  };
+
+  const findHospital = async () => {
+    const q = hospQuery.trim();
+    if (q.length < 3) { Alert.alert('Hospital name', 'Type the hospital name and area, e.g. “Apollo Hospitals, Jubilee Hills”.'); return; }
+    if (selectedAddress?.latitude == null || selectedAddress?.longitude == null) {
+      Alert.alert('Pin your address', 'Your saved address has no map location. Edit the address and use “Use my current location”.');
+      return;
+    }
+    setHospBusy(true);
+    try {
+      const found = await Location.geocodeAsync(q);
+      if (!found.length) { Alert.alert('Hospital not found', 'Try adding the area or city.'); return; }
+      const h = found[0];
+      const check = await hospitalService.distanceCheck({
+        patient_latitude: Number(selectedAddress.latitude), patient_longitude: Number(selectedAddress.longitude),
+        hospital_latitude: h.latitude, hospital_longitude: h.longitude,
+      });
+      setHospital({ name: q, address: q, lat: h.latitude, lng: h.longitude, km: check.distance_km, ok: check.within_limit });
+    } catch (e: any) {
+      Alert.alert('Could not check the hospital', hospitalError(e).message);
+    } finally {
+      setHospBusy(false);
+    }
+  };
+
+  const startBooking = () => {
+    if (!validate()) return;
+    if (needsPrescriptionGate) {
+      setGateOpen(true);
+      return;
+    }
+    submit();
+  };
+
+  /**
+   * Workflows 1 & 2 — create the booking through the guarded endpoints, which
+   * attach the prescription (and, for Workflow 2, the supply guardrail) and
+   * park the booking in `prescription_pending` for pharmacist review.
+   */
+  const submitGuarded = async (result: PrescriptionSupplyResult) => {
+    if (!pkg || !effectivePatientId || !selectedAddress) return;
+    setSubmitting(true);
+    try {
+      const common = {
+        package_id: pkg.id,
+        patient_id: effectivePatientId,
+        scheduled_date: days[dayIdx].ymd,
+        scheduled_start_time: to24HourTime(slot),
+        address_snapshot: selectedAddress as unknown as Record<string, any>,
+        latitude: selectedAddress.latitude ?? 0,
+        longitude: selectedAddress.longitude ?? 0,
+        special_instructions: notes.trim() || undefined,
+        prescription_base64: result.prescriptionBase64,
+      };
+      const created = result.supplyConfirmation
+        ? await compositeCareService.createServiceOnlyBooking({
+            ...common,
+            supply_confirmation: result.supplyConfirmation,
+            supply_photo_base64: result.supplyPhotoBase64,
+          })
+        : await compositeCareService.createBooking({
+            ...common,
+            ...(nurseBrings ? { add_materials: true } : {}),
+          });
+      setGateOpen(false);
+      if (!(await saveHospitalDetails(created.id))) return;
+      await savePrefs(created.id);
+      await ackBookingMaterials(created.id);
+      clearDraft().catch(() => {});
+      router.replace({ pathname: '/payment', params: { bookingId: created.id } });
+    } catch (e: any) {
+      const detail = e?.detail?.detail ?? e?.detail;
+      Alert.alert(
+        'Could not create booking',
+        (typeof detail === 'string' ? detail : detail?.message) ||
+          e?.message ||
+          'Please try again.',
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const submit = async () => {
+    if (!validate() || !pkg || !effectivePatientId || !effectiveAddressId) return;
+
+    setSubmitting(true);
+    try {
+      const created = await createBookingAPI({
+        patient_id: effectivePatientId,
+        package_id: pkg.id,
+        booking_type: 'one_time',
+        scheduled_date: days[dayIdx].ymd,
+        scheduled_start_time: to24HourTime(slot),
+        is_urgent: isUrgent,
+        // A saved address carries the coordinates dispatch measures from, so
+        // reference it rather than re-sending a snapshot.
+        address_id: effectiveAddressId,
+        special_instructions: notes.trim() || undefined,
+        prescription_option: rxDemo ? rxOption : undefined,
+      });
+      if (!(await saveHospitalDetails(created.id))) return;
+      await savePrefs(created.id);
+      await ackBookingMaterials(created.id);
+      clearDraft().catch(() => {});
+      router.replace({ pathname: '/payment', params: { bookingId: created.id } });
+    } catch (e: any) {
+      const detail = e?.detail?.detail ?? e?.detail;
+      Alert.alert(
+        'Could not create booking',
+        (typeof detail === 'string' ? detail : detail?.message) ||
+          e?.message ||
+          'Please try again.',
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (!pkg) {
+    return (
+      <SafeAreaView style={styles.safe} edges={['top']}>
+        <Header title="Confirm booking" fallbackHref="/care-types" />
+        <View style={styles.centered}>
+          {packages.length === 0 ? (
+            <ActivityIndicator color={Colors.primary} />
+          ) : (
+            <>
+              <Ionicons name="alert-circle-outline" size={40} color={Colors.textTertiary} />
+              <Text style={styles.emptyTxt}>
+                That care package is no longer available. Pick another one to continue.
+              </Text>
+              <GradientButton
+                title="Browse packages"
+                fullWidth={false}
+                onPress={() => router.replace('/care-types')}
+                style={{ marginTop: Spacing.md }}
+              />
+            </>
+          )}
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.safe} testID="booking-screen" edges={['top']}>
+      <OfflineBanner />
+      <Header title="Confirm booking" subtitle={pkg.name} fallbackHref="/care-types" />
+
+      <ScrollView contentContainerStyle={{ padding: Spacing.lg, paddingBottom: 140 }}>
+        {/* -------------------------------------------------- patient ---- */}
+        <Text style={styles.sec}>Who is this visit for?</Text>
+        {patients.length === 0 ? (
+          <TouchableOpacity
+            style={styles.addRow}
+            onPress={() => router.push('/patients')}
+            testID="booking-add-patient"
+          >
+            <Ionicons name="person-add-outline" size={18} color={Colors.primary} />
+            <Text style={styles.addTxt}>Add a patient</Text>
+          </TouchableOpacity>
+        ) : (
+          <>
+            {patients.map((p) => (
+              <SelectRow
+                key={p.id}
+                title={p.full_name}
+                subtitle={p.relationship_to_consumer}
+                selected={p.id === effectivePatientId}
+                onPress={() => setPatientId(p.id)}
+                testID={`patient-${p.id}`}
+              />
+            ))}
+            <TouchableOpacity
+              style={styles.linkRow}
+              onPress={() => router.push('/patients')}
+              testID="booking-manage-patients"
+            >
+              <Ionicons name="add" size={16} color={Colors.primary} />
+              <Text style={styles.linkTxt}>Add another patient</Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        {/* -------------------------------------------------- address ---- */}
+        <Text style={styles.sec}>Service address</Text>
+        {addresses.length === 0 ? (
+          <TouchableOpacity
+            style={styles.addRow}
+            onPress={() => router.push('/addresses')}
+            testID="booking-add-address"
+          >
+            <Ionicons name="location-outline" size={18} color={Colors.primary} />
+            <Text style={styles.addTxt}>Add an address</Text>
+          </TouchableOpacity>
+        ) : (
+          <>
+            {addresses.map((a) => (
+              <SelectRow
+                key={a.id}
+                title={a.label}
+                subtitle={formatAddress(a)}
+                selected={a.id === effectiveAddressId}
+                onPress={() => setAddressId(a.id)}
+                testID={`address-${a.id}`}
+              />
+            ))}
+            <TouchableOpacity
+              style={styles.linkRow}
+              onPress={() => router.push('/addresses')}
+              testID="booking-manage-addresses"
+            >
+              <Ionicons name="add" size={16} color={Colors.primary} />
+              <Text style={styles.linkTxt}>Add another address</Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        {/* ----------------------------------------------------- date ---- */}
+        <Text style={styles.sec}>Choose a date</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 4 }}>
+          {days.map((d, i) => (
+            <TouchableOpacity
+              key={d.ymd}
+              style={[styles.day, dayIdx === i && styles.dayActive]}
+              onPress={() => setDayIdx(i)}
+              testID={`day-${i}`}
+            >
+              <Text style={[styles.dayLabel, dayIdx === i && { color: '#fff' }]}>{d.weekday}</Text>
+              <Text style={[styles.dayNum, dayIdx === i && { color: '#fff' }]}>{d.day}</Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
+        {/* ----------------------------------------------------- slot ---- */}
+        <Text style={styles.sec}>Preferred start time</Text>
+        {availableSlots.length === 0 ? (
+          <Text style={styles.urgentSub}>
+            No more slots left today — please pick another date.
+          </Text>
+        ) : (
+          <View style={styles.slotsGrid}>
+            {availableSlots.map((s) => (
+              <TouchableOpacity
+                key={s.label}
+                style={[styles.slot, slot === s.label && styles.slotActive]}
+                onPress={() => setSlot(s.label)}
+                testID={`slot-${s.label}`}
+              >
+                <Text style={[styles.slotTxt, slot === s.label && { color: '#fff' }]}>
+                  {s.label}
+                </Text>
+                {s.surcharge > 0 && (
+                  <Text style={[styles.slotFee, slot === s.label && { color: '#fff' }]}>
+                    + {inr(s.surcharge)}
+                  </Text>
+                )}
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+        {slotSurcharge > 0 && (
+          <Text style={styles.slotNote} testID="slot-surcharge-note">
+            An extra {inr(slotSurcharge)} applies to start times outside regular hours (
+            {standardHours}). It is included in the total below.
+          </Text>
+        )}
+
+        {/* --------------------------------------------------- urgent ---- */}
+        <TouchableOpacity
+          style={styles.urgentRow}
+          onPress={() => setIsUrgent((v) => !v)}
+          testID="booking-urgent"
+        >
+          <View style={[styles.checkbox, isUrgent && styles.checkboxOn]}>
+            {isUrgent && <Ionicons name="checkmark" size={14} color="#fff" />}
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.urgentTitle}>Mark as urgent</Text>
+            <Text style={styles.urgentSub}>
+              We’ll search a tighter radius first and escalate faster to find someone sooner.
+            </Text>
+          </View>
+        </TouchableOpacity>
+
+        {/* ------------------------------------------- hospital + transport --- */}
+        {isHospital && (
+          <View testID="hospital-section">
+            <Text style={styles.sec}>Hospital & transport</Text>
+            <TextInput
+              style={styles.hospInput}
+              placeholder="Hospital name and area, e.g. Apollo Hospitals, Jubilee Hills"
+              value={hospQuery}
+              onChangeText={(t) => { setHospQuery(t); setHospital(null); }}
+              testID="hospital-query"
+            />
+            <TouchableOpacity style={styles.hospBtn} onPress={findHospital} disabled={hospBusy}>
+              {hospBusy ? <ActivityIndicator color="#fff" /> : <Text style={styles.hospBtnTxt}>Check distance</Text>}
+            </TouchableOpacity>
+            {hospital && (
+              <Text style={[styles.hospNote, { color: hospital.ok ? Colors.success : Colors.danger }]}>
+                {hospital.ok
+                  ? `About ${hospital.km} km from the patient (straight-line). This hospital is covered.`
+                  : `About ${hospital.km} km away, beyond the distance we cover. Please contact us to enquire.`}
+              </Text>
+            )}
+            <TouchableOpacity style={styles.hospCheck} onPress={() => setCabByUs((v) => !v)} testID="cab-by-us">
+              <Ionicons name={cabByUs ? 'checkbox' : 'square-outline'} size={22} color={Colors.primary} />
+              <Text style={styles.hospCheckTxt}>NurseConnect books the round-trip cab for the companion</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* -------------------------------------------------- notes ------ */}
+        <Text style={styles.sec}>Anything the nurse should know?</Text>
+        <InputField
+          placeholder="e.g. Patient is bedridden, has dementia, ring the bell twice…"
+          value={notes}
+          onChangeText={setNotes}
+          multiline
+          numberOfLines={3}
+          style={{ minHeight: 80, textAlignVertical: 'top' }}
+          testID="booking-notes"
+        />
+
+        {/* ------------------------------------------------ materials --- */}
+        {isServiceOnly && (
+          <>
+            <Text style={styles.sec}>Medicines & materials</Text>
+            <SelectRow
+              title="I’ll arrange the medicines & materials"
+              subtitle="You’ll upload the prescription and a live photo of the medicines."
+              selected={!nurseBrings}
+              onPress={() => setSuppliesMode('own')}
+              testID="supplies-own"
+            />
+            {canAddMaterials && (
+              <SelectRow
+                title={`Add materials — ${inr(materialsTotal)}`}
+                subtitle="The nurse brings the required materials. The prescription is still needed."
+                selected={nurseBrings}
+                onPress={() => setSuppliesMode('nurse_brings')}
+                testID="supplies-nurse-brings"
+              />
+            )}
+          </>
+        )}
+        {needsMaterials && (
+          <MaterialsChecklist
+            materials={materials}
+            checked={matChecked}
+            onChange={setMatChecked}
+            showPrices
+            subtitle="Please check each item. You’ll confirm this list once more before payment."
+            testID="booking-materials"
+          />
+        )}
+
+        {/* ------------------------------ prescription (TEMP / DEMO) ---- */}
+        {rxDemo && (
+          <View testID="prescription-demo-section">
+            <Text style={styles.sec}>Do you need a doctor’s prescription?  <Text style={{ color: Colors.warning, fontSize: 11 }}>DEMO</Text></Text>
+            <SelectRow
+              title={`Yes — I need a prescription (${inr(rxDemo.fee_inr)})`}
+              subtitle="Demo only — no doctor is assigned and no prescription is issued yet."
+              selected={rxOption === 'yes'}
+              onPress={() => chooseRx('yes')}
+              testID="prescription-yes"
+            />
+            <SelectRow
+              title="No — I already have a prescription / I don’t need it"
+              selected={rxOption === 'no'}
+              onPress={() => chooseRx('no')}
+              testID="prescription-no"
+            />
+          </View>
+        )}
+
+        {prefsEnabled && <BookingPreferencesCard value={prefs} onChange={setPrefs} sameNurseLabel={isBreastfeeding(pkg.name) ? 'Prefer the same nurse for both visits (subject to availability)' : undefined} />}
+
+        {/* --------------------------------------------------- summary --- */}
+        <View style={styles.summaryCard}>
+          <Text style={styles.summaryTitle}>Booking summary</Text>
+          <SummaryRow label="Care package" value={pkg.name} />
+          <SummaryRow label="Patient" value={selectedPatient?.full_name ?? 'Not selected'} />
+          <SummaryRow
+            label="Address"
+            value={selectedAddress ? formatAddress(selectedAddress) : 'Not selected'}
+          />
+          <SummaryRow
+            label="When"
+            value={`${days[dayIdx].weekday} ${days[dayIdx].day} · ${slot}`}
+          />
+          {(nurseBrings || slotSurcharge > 0) && (
+            <SummaryRow label="Package price" value={inr(price)} />
+          )}
+          {nurseBrings && (
+            <SummaryRow label="Materials (nurse brings)" value={inr(materialsTotal)} />
+          )}
+          {slotSurcharge > 0 && (
+            <SummaryRow label="Off-hours time slot" value={inr(slotSurcharge)} />
+          )}
+          {rxDemo && rxOption === 'yes' && (
+            <SummaryRow
+              label="Prescription service (demo — not charged)"
+              value={inr(rxDemo.fee_inr)}
+            />
+          )}
+          <View style={styles.totalRow}>
+            <Text style={styles.totalL}>Total</Text>
+            <Text style={styles.totalR}>{inr(totalPrice)}</Text>
+          </View>
+          <Text style={styles.priceNote}>
+            This is the package price set by NurseConnect. You’ll confirm payment on the next
+            screen — a nurse is only dispatched once payment succeeds.
+          </Text>
+        </View>
+      </ScrollView>
+
+      <SafeAreaView style={styles.stickyBar} edges={['bottom']}>
+        <GradientButton
+          title={needsPrescriptionGate ? 'Continue' : 'Continue to payment'}
+          onPress={startBooking}
+          loading={submitting}
+          disabled={availableSlots.length === 0}
+          testID="proceed-payment-btn"
+        />
+      </SafeAreaView>
+
+      <PrescriptionSupplyGate
+        visible={gateOpen}
+        serviceOnly={isServiceOnly && !nurseBrings}
+        submitting={submitting}
+        onCancel={() => setGateOpen(false)}
+        onNoPrescription={() => {
+          setGateOpen(false);
+          router.push({ pathname: '/care-types', params: { q: 'consultation' } });
+        }}
+        onComplete={submitGuarded}
+      />
+    </SafeAreaView>
+  );
+}
+
+const SelectRow: React.FC<{
+  title: string;
+  subtitle?: string | null;
+  selected: boolean;
+  onPress: () => void;
+  testID?: string;
+}> = ({ title, subtitle, selected, onPress, testID }) => (
+  <TouchableOpacity
+    style={[styles.selectRow, selected && styles.selectRowActive]}
+    onPress={onPress}
+    testID={testID}
+  >
+    <View style={[styles.radio, selected && styles.radioOn]}>
+      {selected && <View style={styles.radioDot} />}
+    </View>
+    <View style={{ flex: 1 }}>
+      <Text style={styles.selectTitle}>{title}</Text>
+      {!!subtitle && (
+        <Text style={styles.selectSub} numberOfLines={2}>
+          {subtitle}
+        </Text>
+      )}
+    </View>
+  </TouchableOpacity>
+);
+
+const SummaryRow: React.FC<{ label: string; value: string }> = ({ label, value }) => (
+  <View style={styles.sumRow}>
+    <Text style={styles.sumL}>{label}</Text>
+    <Text style={styles.sumR} numberOfLines={2}>
+      {value}
+    </Text>
+  </View>
+);
+
+const styles = StyleSheet.create({
+  hospInput: { backgroundColor: Colors.surface, borderWidth: 1, borderColor: Colors.border, borderRadius: Radius.md, padding: Spacing.md, ...Typography.body },
+  hospBtn: { backgroundColor: Colors.primary, borderRadius: Radius.md, padding: Spacing.md, alignItems: 'center', marginTop: Spacing.sm },
+  hospBtnTxt: { color: '#fff', ...Typography.bodyBold },
+  hospNote: { ...Typography.body, marginTop: Spacing.sm },
+  hospCheck: { flexDirection: 'row', alignItems: 'center', gap: Spacing.sm, marginTop: Spacing.md },
+  hospCheckTxt: { ...Typography.body, color: Colors.textPrimary, flexShrink: 1 },
+
+  safe: { flex: 1, backgroundColor: Colors.bgApp },
+  centered: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.lg },
+  emptyTxt: {
+    ...Typography.body,
+    color: Colors.textSecondary,
+    textAlign: 'center',
+    marginTop: Spacing.md,
+  },
+  sec: { ...Typography.h4, color: Colors.textPrimary, marginTop: Spacing.lg, marginBottom: 8 },
+  addRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: Colors.primary,
+    padding: 14,
+  },
+  addTxt: { ...Typography.body, color: Colors.primary, fontWeight: '600' as const },
+  linkRow: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingVertical: 8 },
+  linkTxt: { ...Typography.small, color: Colors.primary, fontWeight: '700' as const },
+  selectRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    borderWidth: 1.5,
+    borderColor: Colors.border,
+    padding: 14,
+    marginBottom: 8,
+  },
+  selectRowActive: { borderColor: Colors.primary, backgroundColor: '#EFF6FF' },
+  radio: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: Colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  radioOn: { borderColor: Colors.primary },
+  radioDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: Colors.primary },
+  selectTitle: { ...Typography.bodyBold, color: Colors.textPrimary },
+  selectSub: { ...Typography.small, color: Colors.textSecondary, marginTop: 2 },
+  day: {
+    width: 60,
+    paddingVertical: 12,
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    alignItems: 'center',
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  dayActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
+  dayLabel: { ...Typography.caption, color: Colors.textSecondary },
+  dayNum: { ...Typography.h3, color: Colors.textPrimary, fontWeight: '800' as const, marginTop: 2 },
+  slotsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  slot: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    minWidth: 100,
+    alignItems: 'center',
+  },
+  slotActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
+  slotTxt: { ...Typography.bodyBold, color: Colors.textPrimary },
+  slotFee: { ...Typography.caption, color: Colors.warning ?? '#B45309', marginTop: 2 },
+  slotNote: { ...Typography.small, color: Colors.textSecondary, marginTop: 8 },
+  urgentRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    padding: 14,
+    marginTop: Spacing.lg,
+  },
+  checkbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: Colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxOn: { backgroundColor: Colors.primary, borderColor: Colors.primary },
+  urgentTitle: { ...Typography.bodyBold, color: Colors.textPrimary },
+  urgentSub: { ...Typography.small, color: Colors.textSecondary, marginTop: 3, lineHeight: 17 },
+  summaryCard: {
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.xl,
+    padding: Spacing.card,
+    marginTop: Spacing.lg,
+    ...Shadows.card,
+  },
+  summaryTitle: { ...Typography.h4, color: Colors.textPrimary, marginBottom: 12 },
+  sumRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 16, paddingVertical: 6 },
+  sumL: { ...Typography.body, color: Colors.textSecondary },
+  sumR: { ...Typography.bodyBold, color: Colors.textPrimary, flex: 1, textAlign: 'right' },
+  totalRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: 12,
+    marginTop: 6,
+    borderTopWidth: 1,
+    borderTopColor: Colors.divider,
+  },
+  totalL: { ...Typography.h4, color: Colors.textPrimary },
+  totalR: { ...Typography.h2, color: Colors.primary, fontWeight: '800' as const },
+  priceNote: { ...Typography.small, color: Colors.textTertiary, marginTop: 10, lineHeight: 17 },
+  stickyBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    padding: Spacing.md,
+    backgroundColor: Colors.surface,
+    borderTopWidth: 1,
+    borderTopColor: Colors.divider,
+  },
+});

@@ -1,0 +1,262 @@
+import { api } from '../lib/api';
+
+/* ============================================================
+   Backend-aligned types (mirror /app/backend/app/schemas/schemas.py)
+   ============================================================ */
+
+export interface VisitRecordOut {
+  id: string;
+  booking_id: string;
+  worker_id: string;
+  patient_id: string;
+  status: 'scheduled' | 'en_route' | 'arrived' | 'in_progress' | 'completed' | 'cancelled' | 'no_show';
+  en_route_at: string | null;
+  arrived_at: string | null;
+  check_in_at: string | null;
+  check_out_at: string | null;
+  actual_duration_minutes: number | null;
+  checklist_responses: Record<string, any> | null;
+  documentation_responses: Record<string, any> | null;
+  documentation_complete: boolean;
+  family_summary: string | null;
+  care_notes: string | null;
+  photo_urls: string[] | null;
+  rating_by_consumer: number | null;
+  rating_comment: string | null;
+  escalation_triggered: boolean;
+  created_at: string;
+}
+
+export interface VitalSignsSubmit {
+  bp_systolic?: number;
+  bp_diastolic?: number;
+  pulse?: number;
+  spo2?: number;
+  temperature_f?: number | string;
+  respiratory_rate?: number;
+  blood_sugar_fasting?: number | string;
+  blood_sugar_random?: number | string;
+  weight_kg?: number | string;
+  pain_score?: number;
+  gcs_score?: number;
+  measurement_device?: string;
+  recorded_at?: string;
+  is_offline_submitted?: boolean;
+}
+
+export interface VitalSignsOut extends Required<Pick<VitalSignsSubmit, 'bp_systolic' | 'bp_diastolic' | 'pulse' | 'spo2'>> {
+  id: string;
+  visit_record_id: string;
+  patient_id: string;
+  temperature_f: string | null;
+  respiratory_rate: number | null;
+  blood_sugar_fasting: string | null;
+  blood_sugar_random: string | null;
+  weight_kg: string | null;
+  pain_score: number | null;
+  gcs_score: number | null;
+  abnormal_flags: string[] | null;
+  escalation_triggered: boolean;
+  escalation_level: 'none' | 'watch' | 'inform_family' | 'contact_doctor' | 'emergency';
+  recorded_at: string;
+}
+
+export interface MedicationSubmit {
+  drug_name: string;
+  drug_generic_name?: string;
+  drug_class?: string;
+  dose_amount: string;
+  dose_unit?: string;
+  route?: 'oral' | 'iv' | 'im' | 'sc' | 'topical' | 'inhalation' | 'sublingual' | 'rectal' | 'other';
+  site?: string;
+  prescription_id?: string;
+  allergy_check_done?: boolean;
+  allergy_confirmed_clear?: boolean;
+  patient_identified?: boolean;
+  expiry_checked?: boolean;
+  administered_at: string; // ISO datetime — required
+  patient_response?: string;
+  adverse_reaction?: boolean;
+  adverse_reaction_notes?: string;
+  batch_number?: string;
+  manufacturer?: string;
+  is_offline_submitted?: boolean;
+}
+
+export interface CheckInPayload {
+  latitude: number;
+  longitude: number;
+}
+
+export interface CheckOutPayload {
+  latitude: number;
+  longitude: number;
+  family_summary?: string;
+  care_notes?: string;
+}
+
+export interface ChecklistResponses {
+  responses: Record<string, any>;
+  is_offline_submitted?: boolean;
+}
+
+export interface RatingPayload {
+  rating: number;
+  comment?: string;
+}
+
+/**
+ * Consumer-side response when generating the visit-start code. The code is
+ * always returned in `otp` — SMS delivery is a convenience, not the source of
+ * truth, so the consumer can read it off their screen for the nurse.
+ */
+export interface VisitStartOtp {
+  sent: boolean;
+  sms_sent: boolean | null;
+  message: string;
+  expires_in_seconds: number;
+  otp: string;
+}
+
+/** Nurse-facing visit report, plus what's still blocking completion. */
+export interface VisitReportOut {
+  booking_id: string;
+  visit_id: string;
+  care_notes: string | null;
+  family_summary: string | null;
+  documentation_complete: boolean;
+  check_in_at: string | null;
+  check_out_at: string | null;
+  actual_duration_minutes: number | null;
+  status: string;
+  can_complete_visit?: boolean;
+  missing_items?: {
+    type: string;
+    id: string;
+    label: string;
+    kind: string;
+    blocks_checkout: boolean;
+  }[];
+}
+
+/** The family-facing view of a finished visit (item 14). */
+export interface ConsumerVisitReportOut {
+  booking_id: string;
+  visit_id: string;
+  family_summary: string | null;
+  check_in_at: string | null;
+  check_out_at: string | null;
+  actual_duration_minutes: number | null;
+  photo_urls: string[];
+  rating_by_consumer: number | null;
+}
+
+export const visitsService = {
+  get: (bookingId: string) => api.get<VisitRecordOut>(`/visits/${bookingId}`),
+
+  /** Nurse: read the report for a visit (works before and after checkout). */
+  getReport: (bookingId: string) => api.get<VisitReportOut>(`/visits/${bookingId}/report`),
+
+  /** Nurse: save or revise the report. Required before a visit can complete. */
+  saveReport: (
+    bookingId: string,
+    payload: { care_notes?: string; family_summary?: string },
+  ) => api.put<VisitReportOut>(`/visits/${bookingId}/report`, payload),
+
+  /**
+   * One-time (60s) PDF link for a completed visit. `view` picks the nurse copy
+   * (includes clinical notes) or the family copy (never includes them).
+   * Open `pdf_url` in the browser; request a fresh link on every tap.
+   */
+  getReportPdfLink: (bookingId: string, view: 'worker' | 'consumer') =>
+    api.get<{ pdf_url: string; download_path: string; expires_in_seconds: number }>(
+      view === 'worker'
+        ? `/visits/${bookingId}/report/pdf`
+        : `/visits/${bookingId}/report/consumer/pdf`,
+    ),
+
+  /** Patient / family: read the finished report for a completed visit. */
+  getConsumerReport: (bookingId: string) =>
+    api.get<ConsumerVisitReportOut>(`/visits/${bookingId}/report/consumer`),
+  checkin: (bookingId: string, lat: number, lng: number) =>
+    api.post<VisitRecordOut>(`/visits/${bookingId}/checkin`, { latitude: lat, longitude: lng }),
+
+  /**
+   * Consumer: ensure a visit-start code exists. Idempotent — returns the live
+   * code (with its remaining TTL) if one is already active.
+   */
+  generateStartOtp: (bookingId: string) =>
+    api.post<VisitStartOtp>(`/visits/${bookingId}/generate-start-otp`),
+
+  /**
+   * Nurse: enter the code the consumer read out to start the visit. Only the
+   * worker assigned to this booking can verify, so the bare 4-digit code is
+   * useless to anyone else. Capped at 5 attempts server-side.
+   */
+  verifyStartOtp: (bookingId: string, otp: string, lat: number, lng: number) =>
+    api.post<VisitRecordOut>(`/visits/${bookingId}/verify-start-otp`, {
+      otp,
+      latitude: lat,
+      longitude: lng,
+    }),
+  checkout: (
+    bookingId: string,
+    payload: { latitude?: number; longitude?: number; family_summary?: string; care_notes?: string }
+  ) =>
+    api.post<VisitRecordOut>(`/visits/${bookingId}/checkout`, {
+      latitude: payload.latitude ?? 0,
+      longitude: payload.longitude ?? 0,
+      family_summary: payload.family_summary,
+      care_notes: payload.care_notes,
+    }),
+  submitVitals: (bookingId: string, v: VitalSignsSubmit) =>
+    api.post<VitalSignsOut>(`/visits/${bookingId}/vitals`, v),
+  vitalsList: (bookingId: string) => api.get<VitalSignsOut[]>(`/visits/${bookingId}/vitals`),
+  logMedication: (bookingId: string, m: MedicationSubmit) =>
+    api.post<{ id: string; escalation_triggered: boolean }>(`/visits/${bookingId}/medications`, m),
+  submitChecklist: (bookingId: string, responses: Record<string, any>, isOfflineSubmitted = false) =>
+    api.post<VisitRecordOut>(`/visits/${bookingId}/checklist`, {
+      responses,
+      is_offline_submitted: isOfflineSubmitted,
+    }),
+  submitRating: (bookingId: string, rating: number, comment?: string) =>
+    api.post<VisitRecordOut>(`/visits/${bookingId}/rating`, { rating, comment }),
+  /** What to ask after a finished visit: nurse stars, then (if enabled) platform feedback. */
+  feedbackStatus: (bookingId: string) =>
+    api.get<{ eligible: boolean; has_nurse: boolean; nurse_rated: boolean; nurse_rating: number | null;
+      platform_feedback_enabled: boolean; platform_rated: boolean; play_store_url: string | null }>(`/bookings/${bookingId}/feedback-status`),
+  submitPlatformFeedback: (bookingId: string, b: { rating: number; comment?: string; allow_publish: boolean }) =>
+    api.post<{ ok: boolean; play_store_url: string | null }>(`/bookings/${bookingId}/platform-feedback`, b),
+};
+
+/* ============================================================
+   Care notes (separate router /care-notes)
+   ============================================================ */
+
+export interface CareNoteOut {
+  id: string;
+  patient_id: string;
+  booking_id: string | null;
+  visit_record_id: string | null;
+  author_id: string;
+  author_role: string;
+  title: string | null;
+  content: string;
+  note_type: string;
+  visible_to_family: boolean;
+  visible_to_worker: boolean;
+  created_at: string;
+}
+
+export const careNotesService = {
+  create: (payload: {
+    patient_id: string;
+    booking_id?: string;
+    title?: string;
+    content: string;
+    note_type?: string;
+    visible_to_family?: boolean;
+    visible_to_worker?: boolean;
+  }) => api.post<CareNoteOut>(`/care-notes/`, payload),
+  listForPatient: (patientId: string) => api.get<CareNoteOut[]>(`/care-notes/patient/${patientId}`),
+};
